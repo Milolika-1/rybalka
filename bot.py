@@ -61,11 +61,11 @@ CATCH_FISH_DIR = BASE_DIR / "assets" / "catch" / "fish"
 MAX_ATTEMPTS = 5
 CATCH_CARD_SCALE = 0.34
 CATCH_CARD_SLOTS = [
-    {"x": 80, "y": 185, "face": "left", "angle": -4},
-    {"x": 620, "y": 185, "face": "right", "angle": 2},
-    {"x": 95, "y": 420, "face": "left", "angle": 0},
-    {"x": 520, "y": 380, "face": "right", "angle": 3},
-    {"x": 470, "y": 690, "face": "left", "angle": -3},
+    {"center_x": 735, "center_y": 410, "face": "right", "angle": 3},
+    {"center_x": 300, "center_y": 635, "face": "left", "angle": -2},
+    {"center_x": 305, "center_y": 315, "face": "left", "angle": -4},
+    {"center_x": 700, "center_y": 735, "face": "right", "angle": -3},
+    {"center_x": 740, "center_y": 260, "face": "right", "angle": 2},
 ]
 CATCH_FIGMA_WIDTHS = {
     "slot_1": 850,
@@ -78,7 +78,7 @@ CATCH_FIGMA_WIDTHS = {
     "slot_9": 650,
     "slot_10": 1450,
     "slot_11": 1100,
-    "slot_12": 472,
+    "slot_12": 750,
     "slot_13": 950,
     "slot_14": 500,
     "slot_15": 800,
@@ -402,6 +402,11 @@ def get_share_slot_ids(
 
 def build_catch_card(caught_slots: set[str], caught_order: list[str] | None) -> BytesIO:
     slot_ids = get_share_slot_ids(caught_slots, caught_order)[:MAX_ATTEMPTS]
+    slot_ids = sorted(
+        slot_ids,
+        key=lambda slot_id: CATCH_FIGMA_WIDTHS.get(slot_id, 0),
+        reverse=True,
+    )
     card = Image.open(CATCH_BACKGROUND_IMAGE).convert("RGBA")
 
     for index, slot_id in enumerate(slot_ids):
@@ -425,7 +430,9 @@ def build_catch_card(caught_slots: set[str], caught_order: list[str] | None) -> 
                 resample=Image.Resampling.BICUBIC,
             )
 
-        card.alpha_composite(fish, (layout["x"], layout["y"]))
+        x = round(layout["center_x"] - fish.width / 2)
+        y = round(layout["center_y"] - fish.height / 2)
+        card.alpha_composite(fish, (x, y))
 
     output = BytesIO()
     output.name = "catch.png"
