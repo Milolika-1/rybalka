@@ -60,12 +60,35 @@ CATCH_BACKGROUND_IMAGE = BASE_DIR / "assets" / "catch" / "background.png"
 CATCH_FISH_DIR = BASE_DIR / "assets" / "catch" / "fish"
 MAX_ATTEMPTS = 5
 CATCH_CARD_SCALE = 0.34
-CATCH_CARD_SLOTS = [
+CATCH_CARD_MARGIN = 18
+CATCH_RESERVED_AREAS = [
+    (40, 80, 560, 180),
+    (900, 0, 1050, 155),
+    (45, 940, 450, 1045),
+]
+CATCH_CARD_CANDIDATES = [
     {"center_x": 735, "center_y": 410, "face": "right", "angle": 3},
     {"center_x": 300, "center_y": 635, "face": "left", "angle": -2},
-    {"center_x": 305, "center_y": 315, "face": "left", "angle": -4},
-    {"center_x": 700, "center_y": 735, "face": "right", "angle": -3},
-    {"center_x": 740, "center_y": 260, "face": "right", "angle": 2},
+    {"center_x": 705, "center_y": 725, "face": "right", "angle": -3},
+    {"center_x": 305, "center_y": 330, "face": "left", "angle": -4},
+    {"center_x": 760, "center_y": 280, "face": "right", "angle": 2},
+    {"center_x": 285, "center_y": 445, "face": "left", "angle": 1},
+    {"center_x": 770, "center_y": 575, "face": "right", "angle": -2},
+    {"center_x": 540, "center_y": 300, "face": "right", "angle": 2},
+    {"center_x": 520, "center_y": 610, "face": "left", "angle": -2},
+    {"center_x": 840, "center_y": 790, "face": "right", "angle": 4},
+    {"center_x": 215, "center_y": 805, "face": "left", "angle": -3},
+    {"center_x": 760, "center_y": 245, "face": "right", "angle": 0},
+    {"center_x": 500, "center_y": 845, "face": "left", "angle": -2},
+    {"center_x": 850, "center_y": 660, "face": "right", "angle": 3},
+    {"center_x": 230, "center_y": 450, "face": "left", "angle": -2},
+    {"center_x": 600, "center_y": 500, "face": "right", "angle": 1},
+    {"center_x": 560, "center_y": 255, "face": "right", "angle": 0},
+    {"center_x": 885, "center_y": 285, "face": "right", "angle": 2},
+    {"center_x": 520, "center_y": 820, "face": "left", "angle": -2},
+    {"center_x": 860, "center_y": 535, "face": "right", "angle": 2},
+    {"center_x": 330, "center_y": 875, "face": "left", "angle": -3},
+    {"center_x": 555, "center_y": 555, "face": "right", "angle": 0},
 ]
 CATCH_FIGMA_WIDTHS = {
     "slot_1": 850,
@@ -400,6 +423,70 @@ def get_share_slot_ids(
     ]
 
 
+def expand_rect(rect: tuple[int, int, int, int], margin: int) -> tuple[int, int, int, int]:
+    left, top, right, bottom = rect
+    return (left - margin, top - margin, right + margin, bottom + margin)
+
+
+def rects_intersect(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> bool:
+    return not (
+        first[2] <= second[0]
+        or first[0] >= second[2]
+        or first[3] <= second[1]
+        or first[1] >= second[3]
+    )
+
+
+def rect_fits_card(rect: tuple[int, int, int, int], card_size: tuple[int, int]) -> bool:
+    width, height = card_size
+    return rect[0] >= 0 and rect[1] >= 0 and rect[2] <= width and rect[3] <= height
+
+
+def find_catch_card_position(
+    fish: Image.Image,
+    occupied_rects: list[tuple[int, int, int, int]],
+    card_size: tuple[int, int],
+) -> tuple[Image.Image, tuple[int, int, int, int], tuple[int, int]] | None:
+    for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.6):
+        scaled_fish = fish
+        if scale != 1.0:
+            scaled_fish = fish.resize(
+                (
+                    round(fish.width * scale),
+                    round(fish.height * scale),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+        for layout in CATCH_CARD_CANDIDATES:
+            placed_fish = scaled_fish
+            if layout["face"] == "right":
+                placed_fish = placed_fish.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            if layout["angle"]:
+                placed_fish = placed_fish.rotate(
+                    layout["angle"],
+                    expand=True,
+                    resample=Image.Resampling.BICUBIC,
+                )
+
+            x = round(layout["center_x"] - placed_fish.width / 2)
+            y = round(layout["center_y"] - placed_fish.height / 2)
+            rect = (x, y, x + placed_fish.width, y + placed_fish.height)
+            padded_rect = expand_rect(rect, CATCH_CARD_MARGIN)
+
+            if not rect_fits_card(rect, card_size):
+                continue
+            if any(rects_intersect(padded_rect, occupied) for occupied in occupied_rects):
+                continue
+
+            return placed_fish, padded_rect, (x, y)
+
+    return None
+
+
 def build_catch_card(caught_slots: set[str], caught_order: list[str] | None) -> BytesIO:
     slot_ids = get_share_slot_ids(caught_slots, caught_order)[:MAX_ATTEMPTS]
     slot_ids = sorted(
@@ -408,31 +495,29 @@ def build_catch_card(caught_slots: set[str], caught_order: list[str] | None) -> 
         reverse=True,
     )
     card = Image.open(CATCH_BACKGROUND_IMAGE).convert("RGBA")
+    occupied_rects = [
+        expand_rect(rect, CATCH_CARD_MARGIN)
+        for rect in CATCH_RESERVED_AREAS
+    ]
 
-    for index, slot_id in enumerate(slot_ids):
+    for slot_id in slot_ids:
         fish_path = CATCH_FISH_DIR / f"{slot_id}.png"
         if not fish_path.exists():
             continue
 
-        layout = CATCH_CARD_SLOTS[index]
         fish = Image.open(fish_path).convert("RGBA")
         figma_width = CATCH_FIGMA_WIDTHS.get(slot_id, fish.width)
         target_width = round(figma_width * CATCH_CARD_SCALE)
         target_height = round(fish.height * target_width / fish.width)
         fish = fish.resize((target_width, target_height), Image.Resampling.LANCZOS)
 
-        if layout["face"] == "right":
-            fish = fish.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        if layout["angle"]:
-            fish = fish.rotate(
-                layout["angle"],
-                expand=True,
-                resample=Image.Resampling.BICUBIC,
-            )
+        position = find_catch_card_position(fish, occupied_rects, card.size)
+        if position is None:
+            continue
 
-        x = round(layout["center_x"] - fish.width / 2)
-        y = round(layout["center_y"] - fish.height / 2)
-        card.alpha_composite(fish, (x, y))
+        placed_fish, occupied_rect, point = position
+        occupied_rects.append(occupied_rect)
+        card.alpha_composite(placed_fish, point)
 
     output = BytesIO()
     output.name = "catch.png"
@@ -535,6 +620,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["slot_order"] = slot_order
     context.user_data["caught_order"] = []
     context.user_data["game_finished_recorded"] = False
+    context.user_data["catch_shared"] = False
 
     with START_IMAGE.open("rb") as photo:
         await update.message.reply_photo(
@@ -652,6 +738,7 @@ async def play_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await query.answer()
     record_event(query.from_user.id, "play_again")
     record_event(query.from_user.id, "game_started")
+    should_send_new_message = context.user_data.get("catch_shared", False)
 
     slot_order = list(FISH_SLOTS)
     random.shuffle(slot_order)
@@ -663,8 +750,24 @@ async def play_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data["slot_order"] = slot_order
     context.user_data["caught_order"] = []
     context.user_data["game_finished_recorded"] = False
+    context.user_data["catch_shared"] = False
 
     with START_IMAGE.open("rb") as photo:
+        if should_send_new_message:
+            try:
+                await query.message.delete()
+            except BadRequest:
+                pass
+
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=photo,
+                caption=START_TEXT,
+                parse_mode="HTML",
+                reply_markup=build_keyboard(slot_order=slot_order),
+            )
+            return
+
         try:
             await query.edit_message_media(
                 media=InputMediaPhoto(
@@ -686,6 +789,7 @@ async def share_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     caught_slots = context.user_data.setdefault("caught_slots", set())
     caught_order = context.user_data.setdefault("caught_order", [])
+    context.user_data["catch_shared"] = True
     share_url = build_share_url(
         caught_slots,
         context.bot_data.get("bot_username"),
