@@ -55,12 +55,13 @@ SMELT_CUSTOM_EMOJI_ID = "5366138603548221529"
 GRAYLING_CUSTOM_EMOJI_ID = "5366291281045660683"
 FORMATTED_MESSAGE_PATH = BASE_DIR / "work" / "last_formatted_message.json"
 FORMATTED_MESSAGES_LOG_PATH = BASE_DIR / "work" / "formatted_messages.jsonl"
+PHOTO_FILE_IDS_PATH = BASE_DIR / "work" / "photo_file_ids.json"
 STATS_DB_PATH = BASE_DIR / "stats.sqlite"
 CATCH_BACKGROUND_IMAGE = BASE_DIR / "assets" / "catch" / "background.png"
 CATCH_FISH_DIR = BASE_DIR / "assets" / "catch" / "fish"
 MAX_ATTEMPTS = 5
 CATCH_CARD_SCALE = 0.34
-CATCH_CARD_MARGIN = 18
+CATCH_CARD_MARGIN = 8
 CATCH_RESERVED_AREAS = [
     (40, 80, 560, 180),
     (900, 0, 1050, 155),
@@ -76,6 +77,8 @@ CATCH_CARD_CANDIDATES = [
     {"center_x": 770, "center_y": 575, "face": "right", "angle": -2},
     {"center_x": 540, "center_y": 300, "face": "right", "angle": 2},
     {"center_x": 520, "center_y": 610, "face": "left", "angle": -2},
+    {"center_x": 315, "center_y": 625, "face": "left", "angle": -2},
+    {"center_x": 430, "center_y": 600, "face": "right", "angle": 2},
     {"center_x": 840, "center_y": 790, "face": "right", "angle": 4},
     {"center_x": 215, "center_y": 805, "face": "left", "angle": -3},
     {"center_x": 760, "center_y": 245, "face": "right", "angle": 0},
@@ -380,6 +383,116 @@ def count_users() -> int:
     return row[0]
 
 
+def load_photo_file_ids() -> dict[str, str]:
+    if not PHOTO_FILE_IDS_PATH.exists():
+        return {}
+
+    try:
+        return json.loads(PHOTO_FILE_IDS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_photo_file_ids(photo_file_ids: dict[str, str]) -> None:
+    PHOTO_FILE_IDS_PATH.parent.mkdir(exist_ok=True)
+    PHOTO_FILE_IDS_PATH.write_text(
+        json.dumps(photo_file_ids, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def cache_message_photo_file_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    image_path: Path,
+    message,
+) -> None:
+    if not message or not getattr(message, "photo", None):
+        return
+
+    photo_file_ids = context.bot_data.setdefault("photo_file_ids", {})
+    photo_file_ids[str(image_path)] = message.photo[-1].file_id
+    save_photo_file_ids(photo_file_ids)
+
+
+def get_warmup_images() -> list[tuple[str, Path]]:
+    images = [("Стартовая картинка", START_IMAGE)]
+    for slot_id, slot in FISH_SLOTS.items():
+        images.append((slot.get("share_name", slot_id), slot["image"]))
+    return images
+
+
+async def reply_cached_photo(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    image_path: Path,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup,
+):
+    photo_file_ids = context.bot_data.setdefault("photo_file_ids", {})
+    cached_file_id = photo_file_ids.get(str(image_path))
+
+    if cached_file_id:
+        try:
+            return await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=cached_file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+        except BadRequest:
+            photo_file_ids.pop(str(image_path), None)
+            save_photo_file_ids(photo_file_ids)
+
+    with image_path.open("rb") as photo:
+        message = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+    cache_message_photo_file_id(context, image_path, message)
+    return message
+
+
+async def edit_cached_photo(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    image_path: Path,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    photo_file_ids = context.bot_data.setdefault("photo_file_ids", {})
+    cached_file_id = photo_file_ids.get(str(image_path))
+    media_photo = cached_file_id
+
+    if cached_file_id:
+        try:
+            message = await query.edit_message_media(
+                media=InputMediaPhoto(
+                    media=media_photo,
+                    caption=caption,
+                    parse_mode="HTML",
+                ),
+                reply_markup=reply_markup,
+            )
+            cache_message_photo_file_id(context, image_path, message)
+            return
+        except BadRequest as error:
+            if "Message is not modified" in str(error):
+                raise
+            photo_file_ids.pop(str(image_path), None)
+            save_photo_file_ids(photo_file_ids)
+
+    with image_path.open("rb") as photo:
+        message = await query.edit_message_media(
+            media=InputMediaPhoto(media=photo, caption=caption, parse_mode="HTML"),
+            reply_markup=reply_markup,
+        )
+    cache_message_photo_file_id(context, image_path, message)
+
+
 def build_caption(fish_text: str, attempts_used: int) -> str:
     attempts_left = MAX_ATTEMPTS - attempts_used
 
@@ -450,7 +563,7 @@ def find_catch_card_position(
     occupied_rects: list[tuple[int, int, int, int]],
     card_size: tuple[int, int],
 ) -> tuple[Image.Image, tuple[int, int, int, int], tuple[int, int]] | None:
-    for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.6):
+    for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.6, 0.52, 0.44, 0.36):
         scaled_fish = fish
         if scale != 1.0:
             scaled_fish = fish.resize(
@@ -622,13 +735,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["game_finished_recorded"] = False
     context.user_data["catch_shared"] = False
 
-    with START_IMAGE.open("rb") as photo:
-        await update.message.reply_photo(
-            photo=photo,
-            caption=START_TEXT,
-            parse_mode="HTML",
-            reply_markup=build_keyboard(slot_order=slot_order),
-        )
+    await reply_cached_photo(
+        context=context,
+        chat_id=update.message.chat_id,
+        image_path=START_IMAGE,
+        caption=START_TEXT,
+        reply_markup=build_keyboard(slot_order=slot_order),
+    )
 
 
 async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -692,15 +805,17 @@ async def choose_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     )
 
-    with image_path.open("rb") as photo:
-        try:
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
-                reply_markup=reply_markup,
-            )
-        except BadRequest as error:
-            if "Message is not modified" not in str(error):
-                raise
+    try:
+        await edit_cached_photo(
+            query=query,
+            context=context,
+            image_path=image_path,
+            caption=text,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            raise
 
 
 async def make_wish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,20 +832,22 @@ async def make_wish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.bot_data.get("bot_username"),
     )
 
-    with GOLD_FISH_IMAGE.open("rb") as photo:
-        try:
-            await query.edit_message_media(
-                media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
-                reply_markup=build_keyboard(
-                    caught_slots,
-                    slot_order,
-                    show_end_actions,
-                    share_url,
-                ),
-            )
-        except BadRequest as error:
-            if "Message is not modified" not in str(error):
-                raise
+    try:
+        await edit_cached_photo(
+            query=query,
+            context=context,
+            image_path=GOLD_FISH_IMAGE,
+            caption=text,
+            reply_markup=build_keyboard(
+                caught_slots,
+                slot_order,
+                show_end_actions,
+                share_url,
+            ),
+        )
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            raise
 
 
 async def play_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -752,34 +869,32 @@ async def play_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     context.user_data["game_finished_recorded"] = False
     context.user_data["catch_shared"] = False
 
-    with START_IMAGE.open("rb") as photo:
-        if should_send_new_message:
-            try:
-                await query.message.delete()
-            except BadRequest:
-                pass
-
-            await context.bot.send_photo(
-                chat_id=query.message.chat_id,
-                photo=photo,
-                caption=START_TEXT,
-                parse_mode="HTML",
-                reply_markup=build_keyboard(slot_order=slot_order),
-            )
-            return
-
+    if should_send_new_message:
         try:
-            await query.edit_message_media(
-                media=InputMediaPhoto(
-                    media=photo,
-                    caption=START_TEXT,
-                    parse_mode="HTML",
-                ),
-                reply_markup=build_keyboard(slot_order=slot_order),
-            )
-        except BadRequest as error:
-            if "Message is not modified" not in str(error):
-                raise
+            await query.message.delete()
+        except BadRequest:
+            pass
+
+        await reply_cached_photo(
+            context=context,
+            chat_id=query.message.chat_id,
+            image_path=START_IMAGE,
+            caption=START_TEXT,
+            reply_markup=build_keyboard(slot_order=slot_order),
+        )
+        return
+
+    try:
+        await edit_cached_photo(
+            query=query,
+            context=context,
+            image_path=START_IMAGE,
+            caption=START_TEXT,
+            reply_markup=build_keyboard(slot_order=slot_order),
+        )
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            raise
 
 
 async def share_catch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -818,6 +933,44 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Дошли до конца: {count_events('game_finished')}\n"
         f"Сыграли снова: {count_events('play_again')}\n"
         f"Нажали «Похвастаться уловом»: {count_events('share_clicked')}"
+    )
+
+
+async def warmup_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    admin_ids = context.bot_data.get("admin_ids", set())
+    user_id = update.effective_user.id
+
+    if admin_ids and user_id not in admin_ids:
+        await update.message.reply_text("Эта команда только для администратора.")
+        return
+
+    await update.message.reply_text(
+        "Начинаю прогрев картинок. Сейчас пришлю служебные изображения."
+    )
+
+    photo_file_ids = context.bot_data.setdefault("photo_file_ids", {})
+    sent_count = 0
+    skipped_count = 0
+
+    for title, image_path in get_warmup_images():
+        cache_key = str(image_path)
+        if cache_key in photo_file_ids:
+            skipped_count += 1
+            continue
+
+        with image_path.open("rb") as photo:
+            message = await update.message.reply_photo(
+                photo=photo,
+                caption=f"Прогрев: {title}",
+            )
+        cache_message_photo_file_id(context, image_path, message)
+        sent_count += 1
+
+    await update.message.reply_text(
+        "Прогрев готов.\n\n"
+        f"Новых картинок загружено: {sent_count}\n"
+        f"Уже были в кэше: {skipped_count}\n\n"
+        "Файл для переноса: work/photo_file_ids.json"
     )
 
 
@@ -876,6 +1029,7 @@ async def post_init(application: Application) -> None:
     bot = await application.bot.get_me()
     application.bot_data["bot_username"] = bot.username
     application.bot_data["admin_ids"] = get_admin_ids()
+    application.bot_data["photo_file_ids"] = load_photo_file_ids()
 
 
 def main() -> None:
@@ -893,6 +1047,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats_admin_fp", stats))
+    app.add_handler(CommandHandler("warmup_photos_fp", warmup_photos))
     app.add_handler(CallbackQueryHandler(make_wish, pattern="^make_wish$"))
     app.add_handler(CallbackQueryHandler(play_again, pattern="^play_again$"))
     app.add_handler(CallbackQueryHandler(share_catch, pattern="^share_catch$"))
